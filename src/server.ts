@@ -6,6 +6,8 @@ import OpenAI from "openai";
 import axios from "axios";
 import fs from "fs";
 import path from "path";
+import GIFEncoder from "gifencoder";
+import { languagesMap } from "./helpers/languagesMap";
 
 dotenv.config();
 
@@ -15,178 +17,174 @@ app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY as string });
 
-// 📌 Define paths for fonts and images
 const fontDir = path.join(__dirname, "fonts");
-const memeDir = path.join(__dirname, "memes"); // Directory to store multiple memes
+const memeDir = path.join(__dirname, "memes");
+if (!fs.existsSync(memeDir)) fs.mkdirSync(memeDir);
 
 const fontPath = path.join(fontDir, "impact.ttf");
-const memePath = path.join(memeDir, `meme-${Date.now()}.png`);
-const tempImagePath = path.join(memeDir, "temp-meme.png");
-
-// 📌 Register Impact font if available
 if (fs.existsSync(fontPath)) {
     registerFont(fontPath, { family: "Impact" });
 } else {
     console.error("❌ Impact font not found:", fontPath);
 }
 
-// 📌 Function to clean generated text
-const cleanText = (text: string): string => text.replace(/^"|"$/g, "").trim();
+const removeQuotes = (text: string): string => text.replace(/^"|"$/g, "").trim();
 
-// 📌 Adjust font size dynamically
-const adjustFontSize = (ctx: CanvasRenderingContext2D, text: string, maxWidth: number, maxFontSize: number): number => {
-    let fontSize = maxFontSize;
-    do {
-        ctx.font = `bold ${fontSize}px Impact`;
-        if (ctx.measureText(text).width <= maxWidth) break;
-        fontSize -= 2;
-    } while (fontSize > 30);
-    return fontSize;
-};
-
-// 📌 Wrap text to fit inside the image
+// 📌 Function to wrap text inside an image
 const wrapText = (ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] => {
     const words = text.split(" ");
     let lines: string[] = [];
-    let line = "";
+    let currentLine = "";
 
     for (let word of words) {
-        const testLine = line + word + " ";
+        const testLine = currentLine + word + " ";
         const metrics = ctx.measureText(testLine);
-        if (metrics.width > maxWidth && line.length > 0) {
-            lines.push(line);
-            line = word + " ";
+        if (metrics.width > maxWidth && currentLine.length > 0) {
+            lines.push(currentLine);
+            currentLine = word + " ";
         } else {
-            line = testLine;
+            currentLine = testLine;
         }
     }
-    lines.push(line.trim());
+
+    lines.push(currentLine.trim());
     return lines;
 };
 
-// 🚀 API Route to generate a meme
+// 📌 Function to generate an animated meme GIF
+const generateAnimatedMeme = async (
+    imagePath: string, text: string, outputGifPath: string, animationSpeed: number,
+    textColor: string, frameCount: number, textPosition: string, fontSize: number
+) => {
+    const encoder = new GIFEncoder(1024, 1024);
+    const gifStream = fs.createWriteStream(outputGifPath);
+    encoder.createReadStream().pipe(gifStream);
+    encoder.start();
+    encoder.setRepeat(0);
+    encoder.setDelay(animationSpeed);
+    encoder.setQuality(10);
+
+    const canvas = createCanvas(1024, 1024);
+    const ctx = canvas.getContext("2d");
+    const image = await loadImage(imagePath);
+    ctx.drawImage(image, 0, 0, 1024, 1024);
+
+    ctx.font = `bold ${fontSize}px Impact`;
+    ctx.fillStyle = textColor;
+    ctx.strokeStyle = "black";
+    ctx.lineWidth = 6;
+    ctx.textAlign = "center";
+
+    const wrappedText = wrapText(ctx, text.toUpperCase(), 900);
+    let yPosition = textPosition === "top" ? 80 : textPosition === "center" ? 512 : 920;
+    const lineSpacing = fontSize + 10;
+    yPosition -= (wrappedText.length - 1) * (lineSpacing / 2);
+
+    // Animation: Fading text
+    for (let i = 0; i < frameCount; i++) {
+        ctx.globalAlpha = Math.abs(Math.sin((i / frameCount) * Math.PI));
+        wrappedText.forEach((line, index) => {
+            ctx.strokeText(line, 512, yPosition + index * lineSpacing);
+            ctx.fillText(line, 512, yPosition + index * lineSpacing);
+        });
+        encoder.addFrame(ctx as any);
+    }
+
+    encoder.finish();
+};
+
 // 🚀 API Route to generate a meme
 app.get("/api/generate-meme", async (req: Request, res: Response): Promise<void> => {
     try {
         console.log("📌 Meme generation request received!");
 
-        // Get the requested language (default: English)
+        // Récupération des paramètres
         const lang = (req.query.lang as string || "en").toLowerCase();
-        console.log(`🌍 Generating meme in language: ${lang}`);
+        const langName = languagesMap[lang as keyof typeof languagesMap];
+        const category = req.query.category as string || "random";
+        const textPosition = req.query.textPosition as string || "bottom";
+        const fontSize = parseInt(req.query.fontSize as string) || 60;
+        const textColor = req.query.textColor as string || "white";
+        const animationSpeed = parseInt(req.query.animationSpeed as string) || 200;
+        const imageStyle = req.query.imageStyle as string || "random";
+        const frameCount = parseInt(req.query.frameCount as string) || 40;
 
-        // Determine the correct language setting
-        const languageMap: Record<string, string> = {
-            en: "English",
-            fr: "French",
-            es: "Spanish",
-            de: "German",
-            th: "Thai",
-            jp: "Japanese",
-            cn: "Chinese",
-            it: "Italian",
-            nl: "Dutch",
-            pl: "Polish",
-            pt: "Portuguese",
-            ro: "Romanian",
-            ru: "Russian",
-            tr: "Turkish",
-            ar: "Arabic",
-            vi: "Vietnamese",
-            id: "Indonesian",
-            ms: "Malay",
-            hi: "Hindi",
-            bn: "Bengali",
-            ta: "Tamil",
-            te: "Telugu"
-        };
+        console.log(`🌍 Language: ${langName}, 📜 Category: ${category}, 🎨 Style: ${imageStyle}`);
 
-        const selectedLanguage = languageMap[lang] || "English";
-
-        // 📝 Step 1: Generate meme text using OpenAI
+        // 🔥 Génération du texte du mème
         const textResponse = await openai.chat.completions.create({
             model: "gpt-4",
             messages: [
-                { role: "system", content: `You are a funny meme generator. Generate a short, catchy, viral meme text in ${selectedLanguage}. Ensure the response is fully in ${selectedLanguage}.` },
-                { role: "user", content: `Generate a funny one-liner for a meme in ${selectedLanguage}. The text must be fully in ${selectedLanguage}.` }
+                { role: "system", content: `You are a meme generator. Create a funny, short, viral meme text in ${langName}, about ${category}.` },
+                { role: "user", content: `Generate a funny one-liner for a meme in ${langName}.` }
             ],
             max_tokens: 50
         });
 
-        let memeText: string = cleanText(textResponse.choices[0]?.message?.content || "When you realize it's Monday...");
+        let memeText = removeQuotes(textResponse.choices[0]?.message?.content || "When you realize it's Monday...");
         console.log("🔹 Final Text:", memeText);
 
-        // 🖼 Step 2: Generate an image using DALL·E without embedded text
+        // 🖼 Génération de l'image avec DALL·E
+        // 🛠️ Correction du prompt de DALL·E pour forcer l'absence de texte
+
         const imageResponse = await openai.images.generate({
             model: "dall-e-3",
-            prompt: `A high-quality humorous image, without text, to match the theme: "${memeText}". The image must not contain any text.`,
+            prompt: `A ${imageStyle} high-quality humorous image, focusing on ${category}. 
+             **Do NOT include any text, captions, speech bubbles, watermarks, or overlays.** 
+             The image should only visually represent the idea and should not have any form of writing.`,
             size: "1024x1024",
             n: 1
         });
 
-        const imageUrl: string = imageResponse.data[0]?.url;
+        const imageUrl = imageResponse.data[0]?.url;
         if (!imageUrl) throw new Error("Failed to generate AI image");
 
         console.log("🖼️ Generated Image:", imageUrl);
 
-        // 📥 Step 3: Download the image
+        const tempImagePath = path.join(memeDir, `temp-meme-${Date.now()}.png`);
         const imageResponseBuffer = await axios.get(imageUrl, { responseType: "arraybuffer" });
         fs.writeFileSync(tempImagePath, imageResponseBuffer.data);
 
-        // ✍️ Step 4: Add text on the image
+        // ✍️ Draw text on static image (PNG)
         const canvas = createCanvas(1024, 1024);
         const ctx = canvas.getContext("2d");
         const image = await loadImage(tempImagePath);
         ctx.drawImage(image, 0, 0, 1024, 1024);
 
-        // 📌 Configure text settings
-        ctx.fillStyle = "white";
+        ctx.font = `bold ${fontSize}px Impact`;
+        ctx.fillStyle = textColor;
         ctx.strokeStyle = "black";
-        ctx.lineWidth = 8;
+        ctx.lineWidth = 6;
         ctx.textAlign = "center";
 
-        // 📌 Adjust font size dynamically and wrap text
-        const maxFontSize = 80;
-        const fontSize: number = adjustFontSize(ctx, memeText, 900, maxFontSize);
-        ctx.font = `bold ${fontSize}px Impact`;
-        const wrappedText: string[] = wrapText(ctx, memeText.toUpperCase(), 900);
-
-        // 📌 Place the text on the image
-        let yPosition = 80;
+        const wrappedText = wrapText(ctx, memeText.toUpperCase(), 900);
+        let yPosition = textPosition === "top" ? 80 : textPosition === "center" ? 512 : 920;
         const lineSpacing = fontSize + 10;
+        yPosition -= (wrappedText.length - 1) * (lineSpacing / 2);
+
         wrappedText.forEach((line, index) => {
             ctx.strokeText(line, 512, yPosition + index * lineSpacing);
             ctx.fillText(line, 512, yPosition + index * lineSpacing);
         });
 
-        // 📤 Step 5: Save and send the image
-        const memeFileName = `meme-${Date.now()}.png`;
-        const memeFilePath = path.join(memeDir, memeFileName);
-        fs.writeFileSync(memeFilePath, canvas.toBuffer("image/png"));
+        const pngFilePath = path.join(memeDir, `meme-${Date.now()}.png`);
+        fs.writeFileSync(pngFilePath, canvas.toBuffer("image/png"));
 
-        // ✅ Return the download link instead of sending the file directly
-        res.json({ message: "Meme successfully generated!", downloadUrl: `http://localhost:3000/download-meme?filename=${memeFileName}` });
+        // 🏆 Génération du GIF animé
+        const gifFileName = `meme-${Date.now()}.gif`;
+        const gifFilePath = path.join(memeDir, gifFileName);
+        await generateAnimatedMeme(tempImagePath, memeText, gifFilePath, animationSpeed, textColor, frameCount, textPosition, fontSize);
+
+        res.json({
+            message: "Meme successfully generated!",
+            staticImage: `http://localhost:3000/memes/${path.basename(pngFilePath)}`,
+            animatedGif: `http://localhost:3000/memes/${gifFileName}`
+        });
 
     } catch (error) {
         console.error("❌ Meme generation error:", error);
         res.status(500).json({ error: "Failed to generate meme." });
     }
-});
-
-// 📥 Route to download the image
-app.get("/download-meme", (req: Request, res: Response) => {
-    if (!fs.existsSync(memePath)) {
-        res.status(404).json({ error: "File not found" });
-        return;
-    }
-    const memeFileName = `meme-${Date.now()}.png`;
-    const memeFilePath = path.join(memeDir, memeFileName);
-    res.download(memeFilePath, memeFileName, (err) => {
-        if (err) {
-            console.error("❌ Error during download:", err);
-        } else {
-            console.log(`✅ Meme ${memeFileName} successfully downloaded!`);
-        }
-    });
 });
 
 // 🚀 Start the server
